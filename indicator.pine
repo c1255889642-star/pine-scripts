@@ -1,0 +1,3 @@
+//@version=6
+indicator("init", overlay=true)
+plot(close)
