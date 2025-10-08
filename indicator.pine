@@ -1,3 +1,317 @@
 //@version=6
-indicator("init", overlay=true)
-plot(close)
+// 使用说明：
+// 1. 将图表周期设置为4小时，默认适用于BTCUSDT，亦可根据需求切换其他交易对。
+// 2. 调整参数面板中的ADX/RSI/量能阈值，以匹配不同币种的波动特征。
+// 3. 可根据行情开启或关闭关键位权重、布林带、超趋势与高周期共振过滤条件。
+// 4. 当面板与警报提示胜率≥70%时，参考给出的入场、止损、止盈建议执行计划。
+// 5. 借助绩效统计（信号数、胜率、回撤估计、最近收益）评估策略稳定度。
+// 6. 建议结合自身风控策略，必要时微调ATR倍数、统计窗口与验证窗口以保持适配。
+
+indicator("多空动能胜率雷达", overlay=true, max_lines_count=500, max_labels_count=500, timeframe="240")
+
+// ==========================
+// ====== 参数设定区域 ======
+// ==========================
+
+emaFastLen = input.int(20, "EMA 快线", minval=1, group="均线")
+emaMidLen = input.int(50, "EMA 中线", minval=1, group="均线")
+emaSlowLen = input.int(200, "EMA 慢线", minval=1, group="均线")
+
+adxLen = input.int(14, "ADX 长度", minval=2, group="动能阈值")
+adxThreshold = input.float(22.0, "ADX 阈值", step=0.1, group="动能阈值")
+rsiLen = input.int(14, "RSI 长度", minval=2, group="动能阈值")
+rsiLower = input.float(35.0, "RSI 多头触发下沿", step=0.1, group="动能阈值")
+rsiMid = input.float(50.0, "RSI 中性位", step=0.1, group="动能阈值")
+rsiUpper = input.float(65.0, "RSI 空头触发上沿", step=0.1, group="动能阈值")
+
+atrLen = input.int(14, "ATR 长度", minval=1, group="ATR 相关")
+entryBufferMult = input.float(0.2, "建议入场缓冲 ATR 倍数", step=0.05, group="ATR 相关")
+stopPanelMult = input.float(1.0, "面板止损 ATR 倍数", step=0.1, group="ATR 相关")
+takePanelMult = input.float(1.5, "面板首个止盈 ATR 倍数", step=0.1, group="ATR 相关")
+winEvalMult = input.float(1.2, "胜率统计盈利 ATR 倍数", step=0.1, group="ATR 相关")
+lossEvalMult = input.float(0.8, "胜率统计亏损 ATR 倍数", step=0.1, group="ATR 相关")
+
+volLen = input.int(20, "成交量均线长度", minval=1, group="量能")
+volFactor = input.float(1.3, "量能放大倍数", step=0.05, group="量能")
+
+pivotLen = input.int(5, "枢轴长度", minval=1, group="权重与过滤")
+useKeyWeight = input.bool(true, "启用关键位权重", group="权重与过滤")
+useBollinger = input.bool(false, "启用布林带过滤", group="权重与过滤")
+useSuperTrend = input.bool(false, "启用超趋势过滤", group="权重与过滤")
+useHTF = input.bool(false, "启用高周期共振 (HTF)", group="权重与过滤")
+htfTf = input.timeframe("1D", "HTF 周期", group="权重与过滤")
+
+bbLen = input.int(20, "布林带长度", minval=1, group="布林带设置")
+bbMult = input.float(2.0, "布林带倍数", step=0.1, group="布林带设置")
+
+stAtrLen = input.int(10, "超趋势 ATR 长度", minval=1, group="超趋势设置")
+stFactor = input.float(3.0, "超趋势系数", step=0.1, group="超趋势设置")
+
+statWindow = input.int(200, "胜率统计窗口 (根数)", minval=20, group="统计与提醒")
+validationWindow = input.int(20, "验证窗口 M (根)", minval=1, group="统计与提醒")
+probAlertThreshold = input.float(70.0, "提醒触发胜率阈值(%)", step=1.0, group="统计与提醒")
+
+// ==========================
+// ====== 指标计算 =========
+// ==========================
+
+emaFast = ta.ema(close, emaFastLen)
+emaMid = ta.ema(close, emaMidLen)
+emaSlow = ta.ema(close, emaSlowLen)
+
+adxVal = ta.adx(adxLen)
+rsiVal = ta.rsi(close, rsiLen)
+atrVal = ta.atr(atrLen)
+volMa = ta.sma(volume, volLen)
+
+bbBasis = ta.sma(close, bbLen)
+bbDev = bbMult * ta.stdev(close, bbLen)
+bbUpper = bbBasis + bbDev
+bbLower = bbBasis - bbDev
+
+float stBasisRaw = na
+int stTrendRaw = 0
+float stBasisRawValue = na
+bool stTrendUp = false
+if useSuperTrend
+    [stBasisRawValue, stTrendUp] = ta.supertrend(stFactor, stAtrLen)
+    stBasisRaw := stBasisRawValue
+    stTrendRaw := stTrendUp ? 1 : -1
+
+htfEma = useHTF ? request.security(syminfo.tickerid, htfTf, ta.ema(close, emaMidLen), lookahead=barmerge.lookahead_off) : na
+
+// ==========================
+// ====== 枢轴与权重 ======
+// ==========================
+
+pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+pivotLow = ta.pivotlow(low, pivotLen, pivotLen)
+
+var float lastPivotHigh = na
+var float lastPivotLow = na
+if not na(pivotHigh)
+    lastPivotHigh := pivotHigh
+if not na(pivotLow)
+    lastPivotLow := pivotLow
+
+nearKeyHigh = useKeyWeight and not na(lastPivotHigh) and math.abs(close - lastPivotHigh) <= atrVal * 0.5
+nearKeyLow = useKeyWeight and not na(lastPivotLow) and math.abs(close - lastPivotLow) <= atrVal * 0.5
+
+// ==========================
+// ====== 信号条件定义 ======
+// ==========================
+
+longBase = close > emaMid and emaFast > emaMid and adxVal > adxThreshold and rsiVal[1] < rsiLower and rsiVal >= rsiLower and rsiVal <= rsiMid and volume > volMa * volFactor
+shortBase = close < emaMid and emaFast < emaMid and adxVal > adxThreshold and rsiVal[1] > rsiUpper and rsiVal <= rsiUpper and rsiVal >= rsiMid and volume > volMa * volFactor
+
+bbFilterLong = not useBollinger or (close >= bbBasis and close <= bbUpper)
+bbFilterShort = not useBollinger or (close <= bbBasis and close >= bbLower)
+
+stFilterLong = not useSuperTrend or (stTrendRaw == 1 and close >= stBasisRaw)
+stFilterShort = not useSuperTrend or (stTrendRaw == -1 and close <= stBasisRaw)
+
+htfFilterLong = not useHTF or (not na(htfEma) and close >= htfEma)
+htfFilterShort = not useHTF or (not na(htfEma) and close <= htfEma)
+
+longSignalRaw = longBase and bbFilterLong and stFilterLong and htfFilterLong
+shortSignalRaw = shortBase and bbFilterShort and stFilterShort and htfFilterShort
+
+longWeight = longSignalRaw ? 1 + (nearKeyLow ? 1 : 0) : 0
+shortWeight = shortSignalRaw ? 1 + (nearKeyHigh ? 1 : 0) : 0
+
+// ==========================
+// ====== 胜率估计模块 ======
+// ==========================
+
+var array<int> signalDir = array.new_int()
+var array<int> signalBar = array.new_int()
+var array<float> signalEntry = array.new_float()
+var array<float> signalAtr = array.new_float()
+var array<int> signalResult = array.new_int()
+var array<float> signalOutcome = array.new_float()
+var array<int> signalWeightArr = array.new_int()
+
+const int DIR_NONE = 0
+const int DIR_LONG = 1
+const int DIR_SHORT = -1
+
+calcProbability(_dir) =>
+    float wins = 0.0
+    float total = 0.0
+    for i = 0 to array.size(signalDir) - 1
+        dirVal = array.get(signalDir, i)
+        if dirVal == _dir or _dir == DIR_NONE
+            entryBarIndex = array.get(signalBar, i)
+            if bar_index - entryBarIndex <= statWindow
+                resultVal = array.get(signalResult, i)
+                if resultVal != -1
+                    total += 1.0
+                    if resultVal == 1
+                        wins += 1.0
+    total > 0 ? wins / total * 100.0 : na
+
+calcRecentStats() =>
+    float total = 0.0
+    float wins = 0.0
+    float equity = 0.0
+    float peak = 0.0
+    float maxDD = 0.0
+    float lastReturn = na
+    for i = 0 to array.size(signalDir) - 1
+        entryBarIndex = array.get(signalBar, i)
+        if bar_index - entryBarIndex <= statWindow
+            resultVal = array.get(signalResult, i)
+            outcome = array.get(signalOutcome, i)
+            if resultVal != -1
+                total += 1.0
+                if resultVal == 1
+                    wins += 1.0
+                if not na(outcome)
+                    equity += outcome
+                    peak := math.max(peak, equity)
+                    dd = peak - equity
+                    maxDD := math.max(maxDD, dd)
+                    lastReturn := outcome
+    [total, wins, maxDD, lastReturn]
+
+resolveSignals() =>
+    for i = 0 to array.size(signalDir) - 1
+        if array.get(signalResult, i) == -1
+            entryIdx = array.get(signalBar, i)
+            barsPassed = bar_index - entryIdx
+            atrEntry = array.get(signalAtr, i)
+            entryPrice = array.get(signalEntry, i)
+            dirVal = array.get(signalDir, i)
+            stopLevel = dirVal == DIR_LONG ? entryPrice - lossEvalMult * atrEntry : entryPrice + lossEvalMult * atrEntry
+            takeLevel = dirVal == DIR_LONG ? entryPrice + winEvalMult * atrEntry : entryPrice - winEvalMult * atrEntry
+            stopHit = dirVal == DIR_LONG ? low <= stopLevel : high >= stopLevel
+            takeHit = dirVal == DIR_LONG ? high >= takeLevel : low <= takeLevel
+            if stopHit and not takeHit
+                array.set(signalResult, i, 0)
+                array.set(signalOutcome, i, -lossEvalMult)
+            else if takeHit
+                array.set(signalResult, i, 1)
+                array.set(signalOutcome, i, winEvalMult)
+            else if barsPassed > validationWindow
+                array.set(signalResult, i, 0)
+                array.set(signalOutcome, i, -lossEvalMult)
+
+resolveSignals()
+
+trimOldSignals() =>
+    maxLookback = statWindow * 3
+    while array.size(signalDir) > 0 and bar_index - array.get(signalBar, 0) > maxLookback
+        array.shift(signalDir)
+        array.shift(signalBar)
+        array.shift(signalEntry)
+        array.shift(signalAtr)
+        array.shift(signalResult)
+        array.shift(signalOutcome)
+        array.shift(signalWeightArr)
+
+trimOldSignals()
+
+// ==========================
+// ====== 新信号登记 ======
+// ==========================
+
+triggerLong = longSignalRaw
+triggerShort = shortSignalRaw
+
+var array<label> signalLabels = array.new<label>()
+
+registerSignal(_dir, _weight) =>
+    array.push(signalDir, _dir)
+    array.push(signalBar, bar_index)
+    array.push(signalEntry, close)
+    array.push(signalAtr, atrVal)
+    array.push(signalResult, -1)
+    array.push(signalOutcome, na)
+    array.push(signalWeightArr, _weight)
+
+    dirText = _dir == DIR_LONG ? "多头" : "空头"
+    prob = calcProbability(_dir)
+    entryRangeLow = close - entryBufferMult * atrVal
+    entryRangeHigh = close + entryBufferMult * atrVal
+    stopLevel = _dir == DIR_LONG ? close - stopPanelMult * atrVal : close + stopPanelMult * atrVal
+    takeLevel = _dir == DIR_LONG ? close + takePanelMult * atrVal : close - takePanelMult * atrVal
+    rr = takePanelMult / stopPanelMult
+    probText = na(prob) ? "不足" : str.tostring(prob, format.mintick) + "%"
+    weightText = _weight > 1 ? "(含关键位)" : ""
+
+    labelColor = _dir == DIR_LONG ? color.new(color.lime, 0) : color.new(color.red, 0)
+    newLabel = label.new(bar_index, close, text=dirText + " 信号" + weightText + "\n胜率估计:" + probText, style=label.style_label_up, color=labelColor, textcolor=color.black)
+    array.push(signalLabels, newLabel)
+    if array.size(signalLabels) > 2
+        oldLabel = array.shift(signalLabels)
+        if not na(oldLabel)
+            label.delete(oldLabel)
+
+if triggerLong
+    registerSignal(DIR_LONG, longWeight)
+if triggerShort
+    registerSignal(DIR_SHORT, shortWeight)
+
+// ==========================
+// ====== 统计与面板 ========
+// ==========================
+
+probLong = calcProbability(DIR_LONG)
+probShort = calcProbability(DIR_SHORT)
+
+[statTotal, statWins, statMaxDD, statLastReturn] = calcRecentStats()
+winRateOverall = statTotal > 0 ? statWins / statTotal * 100.0 : na
+
+entryRangeLowPanel = close - entryBufferMult * atrVal
+entryRangeHighPanel = close + entryBufferMult * atrVal
+stopLevelPanelLong = close - stopPanelMult * atrVal
+stopLevelPanelShort = close + stopPanelMult * atrVal
+takeLevelPanelLong = close + takePanelMult * atrVal
+takeLevelPanelShort = close - takePanelMult * atrVal
+
+lastDir = array.size(signalDir) > 0 ? array.get(signalDir, array.size(signalDir) - 1) : DIR_NONE
+lastWeight = array.size(signalWeightArr) > 0 ? array.get(signalWeightArr, array.size(signalWeightArr) - 1) : 0
+lastProb = lastDir == DIR_LONG ? probLong : lastDir == DIR_SHORT ? probShort : na
+
+var table infoTable = table.new(position.top_right, 1, 7, bgcolor=color.new(color.black, 35))
+if barstate.islast
+    dirText = lastDir == DIR_LONG ? "多头" : lastDir == DIR_SHORT ? "空头" : "暂无"
+    weightText = lastWeight > 1 ? "关键位+" + str.tostring(lastWeight - 1) : "标准"
+    probText = na(lastProb) ? "不足" : str.tostring(lastProb, format.mintick) + "%"
+    entryText = lastDir == DIR_LONG or lastDir == DIR_SHORT ? str.tostring(entryRangeLowPanel, format.price) + " ~ " + str.tostring(entryRangeHighPanel, format.price) : "--"
+    stopText = lastDir == DIR_LONG ? str.tostring(stopLevelPanelLong, format.price) : lastDir == DIR_SHORT ? str.tostring(stopLevelPanelShort, format.price) : "--"
+    takeText = lastDir == DIR_LONG ? str.tostring(takeLevelPanelLong, format.price) : lastDir == DIR_SHORT ? str.tostring(takeLevelPanelShort, format.price) : "--"
+    rrText = str.tostring(takePanelMult / stopPanelMult, format.mintick)
+    statText = statTotal > 0 ? str.tostring(winRateOverall, format.mintick) + "%" : "--"
+    ddText = statTotal > 0 ? str.tostring(statMaxDD, format.mintick) + " ATR" : "--"
+    lastReturnText = not na(statLastReturn) ? str.tostring(statLastReturn, format.mintick) + " ATR" : "--"
+
+    table.cell(infoTable, 0, 0, text="最新方向: " + dirText + " (" + weightText + ")", text_color=color.white, text_halign=text.align_left)
+    table.cell(infoTable, 0, 1, text="建议入场: " + entryText, text_color=color.white)
+    table.cell(infoTable, 0, 2, text="止损/止盈: " + stopText + " / " + takeText, text_color=color.white)
+    table.cell(infoTable, 0, 3, text="期望RR: " + rrText + " 胜率估计: " + probText, text_color=color.white)
+    table.cell(infoTable, 0, 4, text="近" + str.tostring(statWindow) + "根信号数: " + str.tostring(statTotal, format.mintick) + " 胜率: " + statText, text_color=color.white)
+    table.cell(infoTable, 0, 5, text="ATR估算最大回撤: " + ddText, text_color=color.white)
+    table.cell(infoTable, 0, 6, text="最近信号结果: " + lastReturnText, text_color=color.white)
+
+// ==========================
+// ====== 警报与绘图 ========
+// ==========================
+
+alertConditionMet = (triggerLong and not na(probLong) and probLong >= probAlertThreshold) or (triggerShort and not na(probShort) and probShort >= probAlertThreshold)
+alertcondition(alertConditionMet, title="胜率达标", message="胜率≥" + str.tostring(probAlertThreshold) + "%: " + (triggerLong ? "多头" : "空头") + "信号")
+
+plot(emaFast, color=color.new(color.teal, 0), linewidth=2, title="EMA" + str.tostring(emaFastLen))
+plot(emaMid, color=color.new(color.orange, 0), linewidth=2, title="EMA" + str.tostring(emaMidLen))
+plot(emaSlow, color=color.new(color.purple, 0), linewidth=2, title="EMA" + str.tostring(emaSlowLen))
+plot(useBollinger ? bbUpper : na, color=color.new(color.blue, 0), title="布林上轨")
+plot(useBollinger ? bbLower : na, color=color.new(color.blue, 0), title="布林下轨")
+plot(useSuperTrend ? stBasisRaw : na, color=color.new(color.yellow, 0), title="超趋势基线")
+
+plotshape(triggerLong, title="多头信号", style=shape.triangleup, location=location.belowbar, color=color.new(color.lime, 0), size=size.large, display=display.none)
+plotshape(triggerShort, title="空头信号", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 0), size=size.large, display=display.none)
+
+plot(statTotal, title="近窗信号总数", display=display.none)
+plot(winRateOverall, title="近窗胜率(%)", display=display.none)
+plot(statMaxDD, title="ATR估算最大回撤", display=display.none)
+plot(statLastReturn, title="最近信号回报(ATR)", display=display.none)
