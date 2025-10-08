@@ -59,7 +59,7 @@ emaFast = ta.ema(close, emaFastLen)
 emaMid = ta.ema(close, emaMidLen)
 emaSlow = ta.ema(close, emaSlowLen)
 
-adxVal = ta.adx(high, low, close, adxLen)
+adxVal = ta.adx(adxLen)
 rsiVal = ta.rsi(close, rsiLen)
 atrVal = ta.atr(atrLen)
 volMa = ta.sma(volume, volLen)
@@ -70,15 +70,13 @@ bbUpper = bbBasis + bbDev
 bbLower = bbBasis - bbDev
 
 float stBasisRaw = na
-float stTrendRawValue = na
-int stTrendDir = na
+int stTrendRaw = 0
+float stBasisRawValue = na
+bool stTrendUp = false
 if useSuperTrend
-    [stBasisRaw, stTrendRawValue] = ta.supertrend(stFactor, stAtrLen)
-    stTrendDir := int(stTrendRawValue)
-else
-    stBasisRaw := na
-    stTrendDir := na
-    stTrendRawValue := na
+    [stBasisRawValue, stTrendUp] = ta.supertrend(stFactor, stAtrLen)
+    stBasisRaw := stBasisRawValue
+    stTrendRaw := stTrendUp ? 1 : -1
 
 htfEma = useHTF ? request.security(syminfo.tickerid, htfTf, ta.ema(close, emaMidLen), lookahead=barmerge.lookahead_off) : na
 
@@ -103,14 +101,14 @@ nearKeyLow = useKeyWeight and not na(lastPivotLow) and math.abs(close - lastPivo
 // ====== 信号条件定义 ======
 // ==========================
 
-longBase = close > emaMid and emaFast > emaMid and adxVal > adxThreshold and ta.crossover(rsiVal, rsiLower) and rsiVal <= rsiMid and volume > volMa * volFactor
-shortBase = close < emaMid and emaFast < emaMid and adxVal > adxThreshold and ta.crossunder(rsiVal, rsiUpper) and rsiVal >= rsiMid and volume > volMa * volFactor
+longBase = close > emaMid and emaFast > emaMid and adxVal > adxThreshold and rsiVal[1] < rsiLower and rsiVal >= rsiLower and rsiVal <= rsiMid and volume > volMa * volFactor
+shortBase = close < emaMid and emaFast < emaMid and adxVal > adxThreshold and rsiVal[1] > rsiUpper and rsiVal <= rsiUpper and rsiVal >= rsiMid and volume > volMa * volFactor
 
 bbFilterLong = not useBollinger or (close >= bbBasis and close <= bbUpper)
 bbFilterShort = not useBollinger or (close <= bbBasis and close >= bbLower)
 
-stFilterLong = not useSuperTrend or (stTrendDir == 1 and close >= stBasisRaw)
-stFilterShort = not useSuperTrend or (stTrendDir == -1 and close <= stBasisRaw)
+stFilterLong = not useSuperTrend or (stTrendRaw == 1 and close >= stBasisRaw)
+stFilterShort = not useSuperTrend or (stTrendRaw == -1 and close <= stBasisRaw)
 
 htfFilterLong = not useHTF or (not na(htfEma) and close >= htfEma)
 htfFilterShort = not useHTF or (not na(htfEma) and close <= htfEma)
@@ -141,11 +139,11 @@ calcProbability(_dir) =>
     float wins = 0.0
     float total = 0.0
     for i = 0 to array.size(signalDir) - 1
-        int dirVal = array.get(signalDir, i)
+        dirVal = array.get(signalDir, i)
         if dirVal == _dir or _dir == DIR_NONE
-            int entryBarIndex = array.get(signalBar, i)
+            entryBarIndex = array.get(signalBar, i)
             if bar_index - entryBarIndex <= statWindow
-                int resultVal = array.get(signalResult, i)
+                resultVal = array.get(signalResult, i)
                 if resultVal != -1
                     total += 1.0
                     if resultVal == 1
@@ -160,10 +158,10 @@ calcRecentStats() =>
     float maxDD = 0.0
     float lastReturn = na
     for i = 0 to array.size(signalDir) - 1
-        int entryBarIndex = array.get(signalBar, i)
+        entryBarIndex = array.get(signalBar, i)
         if bar_index - entryBarIndex <= statWindow
-            int resultVal = array.get(signalResult, i)
-            float outcome = array.get(signalOutcome, i)
+            resultVal = array.get(signalResult, i)
+            outcome = array.get(signalOutcome, i)
             if resultVal != -1
                 total += 1.0
                 if resultVal == 1
@@ -179,11 +177,11 @@ calcRecentStats() =>
 resolveSignals() =>
     for i = 0 to array.size(signalDir) - 1
         if array.get(signalResult, i) == -1
-            int entryIdx = array.get(signalBar, i)
-            int barsPassed = bar_index - entryIdx
-            float atrEntry = array.get(signalAtr, i)
-            float entryPrice = array.get(signalEntry, i)
-            int dirVal = array.get(signalDir, i)
+            entryIdx = array.get(signalBar, i)
+            barsPassed = bar_index - entryIdx
+            atrEntry = array.get(signalAtr, i)
+            entryPrice = array.get(signalEntry, i)
+            dirVal = array.get(signalDir, i)
             stopLevel = dirVal == DIR_LONG ? entryPrice - lossEvalMult * atrEntry : entryPrice + lossEvalMult * atrEntry
             takeLevel = dirVal == DIR_LONG ? entryPrice + winEvalMult * atrEntry : entryPrice - winEvalMult * atrEntry
             stopHit = dirVal == DIR_LONG ? low <= stopLevel : high >= stopLevel
@@ -301,12 +299,11 @@ if barstate.islast
 // ==========================
 
 alertConditionMet = (triggerLong and not na(probLong) and probLong >= probAlertThreshold) or (triggerShort and not na(probShort) and probShort >= probAlertThreshold)
-alertDirText = triggerLong ? "多头" : triggerShort ? "空头" : "无方向"
-alertcondition(alertConditionMet, title="胜率达标", message="胜率≥" + str.tostring(probAlertThreshold) + "%: " + alertDirText + "信号")
+alertcondition(alertConditionMet, title="胜率达标", message="胜率≥" + str.tostring(probAlertThreshold) + "%: " + (triggerLong ? "多头" : "空头") + "信号")
 
-plot(emaFast, color=color.new(color.teal, 0), linewidth=2, title="EMA 快线")
-plot(emaMid, color=color.new(color.orange, 0), linewidth=2, title="EMA 中线")
-plot(emaSlow, color=color.new(color.purple, 0), linewidth=2, title="EMA 慢线")
+plot(emaFast, color=color.new(color.teal, 0), linewidth=2, title="EMA" + str.tostring(emaFastLen))
+plot(emaMid, color=color.new(color.orange, 0), linewidth=2, title="EMA" + str.tostring(emaMidLen))
+plot(emaSlow, color=color.new(color.purple, 0), linewidth=2, title="EMA" + str.tostring(emaSlowLen))
 plot(useBollinger ? bbUpper : na, color=color.new(color.blue, 0), title="布林上轨")
 plot(useBollinger ? bbLower : na, color=color.new(color.blue, 0), title="布林下轨")
 plot(useSuperTrend ? stBasisRaw : na, color=color.new(color.yellow, 0), title="超趋势基线")
